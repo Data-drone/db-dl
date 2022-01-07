@@ -2,6 +2,16 @@
 # MAGIC %md
 # MAGIC 
 # MAGIC ### Setup
+# MAGIC 
+# MAGIC First part of this notebook can be execute on a single node CPU cluster. A GPU cluster will be required to run a second part; minimum GPU requirements are clearly defined for those parts (some cell can be run on a single GPU single node, some will work on a multi-GPU single node cluster and the rest will require multi-node GPU cluster)
+# MAGIC 
+# MAGIC This notebook was developed on a Databrick Runtime 10.1 with the foolowing libraries:
+# MAGIC - torch: 1.9.1+cu111
+# MAGIC - torchvision: 0.10.1+cu111
+# MAGIC - pytorch_lightning: 1.5.8
+# MAGIC - CUDA: 11.4 (`nvidia-smi`)
+# MAGIC - Horovod: 0.23.0
+# MAGIC   
 
 # COMMAND ----------
 
@@ -13,6 +23,7 @@ import io
 import numpy as np
 from functools import partial
 import datetime as dt
+import logging
 
 from PIL import Image
 
@@ -24,6 +35,8 @@ from torchmetrics import Accuracy
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks import TQDMProgressBar
 
 from pyspark.sql.functions import col
 from pyspark.sql.types import LongType
@@ -31,26 +44,28 @@ from pyspark.sql.types import LongType
 from petastorm import TransformSpec
 from petastorm.spark import SparkDatasetConverter, make_spark_converter
 
-print(f'Using:\n - torch: {torch.__version__}\n - torchvision: {torchvision.__version__}\n - pytorch_lightning: {pl.__version__}')
+print(f"Using:\n - torch: {torch.__version__}\n - torchvision: {torchvision.__version__}\n - pytorch_lightning: {pl.__version__}")
 
 # COMMAND ----------
 
 IS_DEV = True
 
-DATA_DIR = '/databricks-datasets/flowers/delta'
+DATA_DIR = "/databricks-datasets/flowers/delta"
 GPU_COUNT = torch.cuda.device_count()
-GPUS = min(1, GPU_COUNT)
-# BATCH_SIZE = 256 if GPU_COUNT > 0 else 64
-BATCH_SIZE = 64
-EPOCH_COUNT = 3
+print(f"Found {GPU_COUNT if GPU_COUNT > 0 else 'no'} GPUs")
 
-WORKER_COUNT = 1
+BATCH_SIZE = 64
+MAX_EPOCH_COUNT = 15
+STEPS_PER_EPOCH = 15
+
 LR = 0.001
 CLASS_COUNT = 5
-print(f'GPU count: {GPU_COUNT}')
 
-SAMPLE_SIZE = 100
-print(f"Sample size: {SAMPLE_SIZE}")
+SAMPLE_SIZE = 1000
+print(f"Sample: size {SAMPLE_SIZE}")
+
+EARLY_STOP_MIN_DELTA = 0.05
+EARLY_STOP_PATIENCE = 3
 
 # Set a cache directory on DBFS FUSE for intermediate data.
 CACHE_DIR = "file:///dbfs/tmp/petastorm/cache"
@@ -69,13 +84,13 @@ def report_duration(action, start):
   h, rem = divmod(ds, 3600)
   m, s = divmod(rem, 60)
   if h > 0:
-      run_time = '{} hours {} minutes'.format(int(h), int(m))
+      run_time = "{} hours {} minutes".format(int(h), int(m))
   elif m > 0:
-      run_time = '{} minutes'.format(int(m))
+      run_time = "{} minutes {} seconds".format(int(m), int(s))
   else:
-      run_time = '{} seconds'.format(int(s))
+      run_time = "{} seconds".format(int(s))
 
-  msg = f'--> {action} completed in {run_time}'
+  msg = f"\n-- {action} completed in ***{run_time}*** at {end.strftime('%Y-%m-%d %H:%M:%S')}\n\n---------------------"
   print(msg)
 
 # COMMAND ----------
@@ -84,13 +99,19 @@ def report_duration(action, start):
 # MAGIC 
 # MAGIC ### Data - the flowers dataset
 # MAGIC 
-# MAGIC This example uses the flowers dataset from the TensorFlow team, which contains flower photos stored under five sub-directories, one per class. It is hosted under Databricks Datasets dbfs:/databricks-datasets/flower_photos for easy access.
+# MAGIC In this notebook we are using the flowers dataset from the TensorFlow team. Whereas the original dataset consists of flower photos stored under five sub-directories, one per class, here we are using a pre-processed dataset stored in Delta format.
 # MAGIC 
-# MAGIC The example loads the flowers table which contains the preprocessed flowers dataset using the binary file data source. It uses a small subset of the flowers dataset to reduce the running time of this notebook. When you run this notebook, you can increase the number of images used for better model accuracy.
+# MAGIC This dataset contains ***3670*** images. To reduce the running time, we are using a smaller subset of the dataset for development and testing purposes in this notebook. 
+# MAGIC 
+# MAGIC ***Note:** The original/unprocced dataset can be also be used in the same ways, it is hosted under Databricks Datasets `dbfs:/databricks-datasets/flower_photos` for easy access.*
 
 # COMMAND ----------
 
-def get_data(sample_size=-1):
+df = spark.read.format("delta").load(DATA_DIR).select(["label"]).limit(SAMPLE_SIZE)
+
+# COMMAND ----------
+
+def get_data(sample_size=-1, partition_count=1):
   df = spark.read.format("delta").load(DATA_DIR).select(["content", "label"])
   if sample_size > 0:
     df = df.limit(sample_size)
@@ -105,21 +126,21 @@ def get_data(sample_size=-1):
   class_index = udf(to_class_index, LongType())
   df = df.withColumn("cls_id", class_index(col("label"))).drop("label")
 
-  train_df, val_df = df.randomSplit([0.9, 0.1], seed=12345)
+  train_df, val_df = df.randomSplit([0.8, 0.2], seed=12)
 
-  # Make sure the number of partitions is at least the number of workers to benefit from distributed training
-  train_df = train_df.repartition(WORKER_COUNT)
-  val_df = val_df.repartition(WORKER_COUNT)
+  # For distributed training data must have at least as many many partitions as the number of devices/processes
+  train_df = train_df.repartition(partition_count)
+  val_df = val_df.repartition(partition_count)
 
-  print(f'Training dataset: {df.count()} (train: {train_df.count()}, val: {val_df.count()})')
-  print(f'Labels ({CLASS_COUNT}): {classes}')
+  print(f"Dataset size: {df.count()} (train: {train_df.count()}, val: {val_df.count()}{'' if partition_count == 1 else ', ' + str(partition_count) + ' partitions each'})")
+  print(f"Labels ({CLASS_COUNT}): {classes}")
   if sample_size > 0:
     display(train_df.limit(10))
   
   return train_df, val_df
 
-def create_spark_converters(use_sample=True):
-  train_df, val_df = get_data(SAMPLE_SIZE if use_sample else -1)
+def create_spark_converters(use_sample=True, partition_count=1):
+  train_df, val_df = get_data(SAMPLE_SIZE if use_sample else -1, partition_count)
   return make_spark_converter(train_df), make_spark_converter(val_df)
 
 
@@ -127,7 +148,7 @@ def create_spark_converters(use_sample=True):
 
 # MAGIC %md
 # MAGIC 
-# MAGIC Dataframe and corresponding Petastorm wrapper need to be created here instead of inside the Pytorch Lightning model class. This is especially important for distributed training (Petastorm spark converter is pickleable) 
+# MAGIC Dataframe and corresponding Petastorm wrappers need to be created here instead of inside the Pytorch Lightning model class. This is especially important for distributed training when model class instances will be created in other nodes where Spark context is not defined (Petastorm spark converter can be pickled) 
 
 # COMMAND ----------
 
@@ -141,7 +162,17 @@ train_sample_converter, val_sample_converter = create_spark_converters(True)
 # MAGIC 
 # MAGIC The model class may look large but I deliberately piled everything into it to show how the most part of the model logic can be encapsulated into a single class
 # MAGIC 
-# MAGIC A callback class like this can be used for things like logging but it is easier to keep all this within the model
+# MAGIC A special note about the value of parameter `num_epochs` used in `make_torch_dataloader` function. We set it to `None` (it is also a default value) to generate infinite batches of data to avoid handling the last incomplete batch. This is especially important for distributed training where we need to guarantee that the numbers of data records seen on all workers are identical per step. Given that the length of each data shard may not be identical, setting `num_epochs` to any specific number would fail to meet the guarantee and will likely result in an error.
+# MAGIC 
+# MAGIC Even though this is not really important for single device training, it determines the way we control epochs (training will run forever on infinite dataset which means there would be only 1 if other controls are not used), so we decided to introduce it from the beginning.
+# MAGIC 
+# MAGIC There is another place when this is important - the validation process. Pytorch Lightning Trainer, by default, will run a sanity validation check prior to any training, unless instructed otherwise (i.e. `num_sanity_val_steps` is set to be equal to `0`). That sanity check will initialise the validation data loader and will use those few initial batches defined by `num_sanity_val_steps`. However, because of doing so it will load the validation data loader before the first epoch but will not do so for the validation phase of the first epoch which will result in error (an attempt to read a second time from data loader which was not completed in the previous attempt). Possible workarounds is using a finite amount of epochs in `num_epochs` (e.g. `num_epochs=1` as there is no point in evaluating on repeated dataset), which is not good as it will likely result in a last batch being smaller than other batches. At the time of creating this notebook there is no way to set an equivalent of `drop_last` for the Data Loader created by `make_torch_dataloader`. The only way to work around this is to avoid doing any sanity checks (i.e. setting `num_sanity_val_steps=0`, setting it to anything else doesn't work) and using `limit_val_batches` parameter of the Trainer class.
+# MAGIC 
+# MAGIC 
+# MAGIC 
+# MAGIC 
+# MAGIC 
+# MAGIC A separate callback class like this can be used for sidecar operations like logging, etc but it is easier to keep all this within the model
 # MAGIC ```
 # MAGIC from pytorch_lightning.callbacks import Callback
 # MAGIC 
@@ -167,14 +198,18 @@ train_sample_converter, val_sample_converter = create_spark_converters(True)
 # COMMAND ----------
 
 class LitClassificationModel(pl.LightningModule):
-  def __init__(self, train_converter, val_converter, class_count=CLASS_COUNT, lr=LR):
+  def __init__(self, train_converter, val_converter, class_count=CLASS_COUNT, lr=LR, logging_level=logging.INFO, device_id=0, device_count=1):
     super().__init__()
     self.lr = lr
     self.model = self.get_model(class_count, lr)
     self.train_converter = train_converter
     self.val_converter = val_converter
     self.train_dataloader_context = None
-    self.state = {"epochs": 0, "batches": 0}
+    self.val_dataloader_context = None
+    self.state = {"epochs": 0}
+    self.logging_level = logging_level
+    self.device_id = device_id
+    self.device_count = device_count
 
   def configure_optimizers(self):
     optimizer = torch.optim.SGD(self.model.classifier[1].parameters(), lr=self.lr, momentum=0.9)
@@ -183,40 +218,87 @@ class LitClassificationModel(pl.LightningModule):
   def forward(self, x):
     x = self.model(x)
     return x
-
+  
   def training_step(self, batch, batch_idx):
-    X, y = batch['features'], batch['cls_id']
+    X, y = batch["features"], batch["cls_id"]
+    pred = self(X)
+    loss = F.cross_entropy(pred, y)
+    
+    # Choosing to use step loss as a metric. Use the next (commented out) line instead if averaged epoch loss if preferred
+    # self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+    self.log("train_loss", loss, prog_bar=True)
+    
+    if self.logging_level == logging.DEBUG:
+      if batch_idx == 0:
+        print(f" - [{self.device_id}] training batch size: {y.shape[0]}")
+      print(f" - [{self.device_id}] training batch: {batch_idx}, loss: {loss}")
+      
+    return loss
+
+  def training_step_end(self, training_step_outputs):
+    if self.logging_level == logging.DEBUG:
+      print(f" - [{self.device_id}] training step output: {training_step_outputs.item()}")
+  
+  def training_epoch_end(self, training_step_outputs):
+    if self.logging_level == logging.DEBUG:
+      print(f" - [{self.device_id}] training epoch output: {training_step_outputs}")
+    
+  def on_train_epoch_start(self):
+    # No need to re-load data here as `train_dataloader` will be called on each epoch
+    if self.logging_level in (logging.DEBUG, logging.INFO):
+      print(f"++ [{self.device_id}] Epoch: {self.state['epochs']}")
+    self.state["epochs"] += 1
+
+  def train_dataloader(self):
+    return self.get_dataloader_context(is_train=True).__enter__()
+    
+  def validation_step(self, batch, batch_idx):
+    X, y = batch["features"], batch["cls_id"]
     pred = self(X)
     loss = F.cross_entropy(pred, y)
     acc = FM.accuracy(pred, y)
-    print(f'\t - batch_idx: {batch_idx}, ({len(y)})')
-    print(f'\t - loss: {loss}, acc: {acc}')
-    return loss
 
-  def on_epoch_start(self):
-    print(f"--> Epoch: {self.state['epochs']}")
-    self.state["epochs"] += 1
-
-#     # First epoch will already have data loader
-#     if self.state["epochs"] > 1:
-#       # Need to explicity Enter the context, trainer does not seem to be able to work with a context
-#       self.trainer.train_dataloader = self.train_dataloader()
-
-  def on_epoch_end(self):
-    print(f"<-- (epoch: {self.state['epochs'] - 1})")
+    # Roll validation up to epoch level
+    self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+    self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
     
-    # Need to reset DataLoader on each epoch. ContextManager is stored in this class, not in `trainer`, destroy it. If new one is needed,
-    # it will be created at the start of next epoch
+    if self.logging_level == logging.DEBUG:
+      print(f" - [{self.device_id}] val batch: {batch_idx}, size: {y.shape[0]}, loss: {loss}, acc: {acc}")
+
+    return {"loss": loss, "acc": acc}
+  
+# #   def validation_step_end(self, batch_parts):
+# #     accs = batch_parts["acc"]
+# #     losses = batch_parts["loss"]
+# #     return (losses[0] + losses[1]) / 2
+
+  def val_dataloader(self):
+    return self.get_dataloader_context(is_train=False).__enter__()
+
+  def on_train_end(self):
+    # Close all readers as a best practice (plus actually helps avoid failure of the distributed training)
     self.train_dataloader_context.__exit__(None, None, None)
-
-  def train_dataloader(self):
+    self.val_dataloader_context.__exit__(None, None, None)
     
-    print(f"--> LitClassificationModel.train_dataloader")
+  def get_dataloader_context(self, is_train=True):
+    if self.logging_level == logging.DEBUG:
+      print(f" - [{self.device_id}] get_dataloader_context({'Train' if is_train else 'Val'})")
     
     # To improve performance, do the data transformation in a TransformSpec function in petastorm instead of Spark Dataframe
-    self.train_dataloader_context = self.train_converter.make_torch_dataloader(transform_spec=self.get_transform_spec(is_train=True), num_epochs=1, batch_size=BATCH_SIZE)
-    return self.train_dataloader_context.__enter__()
-
+    if is_train:
+      if self.train_dataloader_context:
+        self.train_dataloader_context.__exit__(None, None, None)
+      self.train_dataloader_context = self.train_converter.make_torch_dataloader(transform_spec=self._get_transform_spec(is_train=True), num_epochs=None,
+                                                                                 cur_shard=self.device_id, shard_count=self.device_count, batch_size=BATCH_SIZE*self.device_count)
+      return self.train_dataloader_context
+    else:
+      # https://petastorm.readthedocs.io/en/latest/_modules/petastorm/spark/spark_dataset_converter.html#SparkDatasetConverter.make_torch_dataloader
+      if self.val_dataloader_context:
+        self.val_dataloader_context.__exit__(None, None, None)
+      self.val_dataloader_context = self.val_converter.make_torch_dataloader(transform_spec=self._get_transform_spec(is_train=False), num_epochs=None, 
+                                                                             cur_shard=self.device_id, shard_count=self.device_count,  batch_size=BATCH_SIZE*self.device_count)
+      return self.val_dataloader_context
+  
   def get_model(self, class_count, lr):
     model = torchvision.models.mobilenet_v2(pretrained=True)
 
@@ -247,54 +329,57 @@ class LitClassificationModel(pl.LightningModule):
 
     trans = transforms.Compose(transformers)
 
-    batch['features'] = batch['content'].map(lambda x: trans(x).numpy())
-    batch = batch.drop(labels=['content'], axis=1)
+    batch["features"] = batch["content"].map(lambda x: trans(x).numpy())
+    batch = batch.drop(labels=["content"], axis=1)
     return batch
 
-  def get_transform_spec(self, is_train=True):
-    # The output shape of the `TransformSpec` is not automatically known by petastorm, 
-    # so you need to specify the shape for new columns in `edit_fields` and specify the order of 
-    # the output columns in `selected_fields`.
+  def _get_transform_spec(self, is_train=True):
+    # The output shape of the `TransformSpec` is not automatically known by petastorm, so we need to specify the shape for new columns in `edit_fields`
+    # and specify the order of the output columns in `selected_fields`
     return TransformSpec(partial(self._transform_row, is_train), 
-                         edit_fields=[('features', np.float32, (3, 224, 224), False)], 
-                         selected_fields=['features', 'cls_id'])
+                         edit_fields=[("features", np.float32, (3, 224, 224), False)], 
+                         selected_fields=["features", "cls_id"])
+
+
+# COMMAND ----------
+
+def train(train_converter, val_converter, gpus=0, strategy=None, device_id=0, device_count=1, logging_level=logging.INFO):
   
-# TODO
-#     def validation_step(self, batch, batch_idx):
-#         x, y = batch
-#         logits = self(x)
-#         loss = F.nll_loss(logits, y)
-#         preds = torch.argmax(logits, dim=1)
-#         self.accuracy(preds, y)
+  start = dt.datetime.now()
 
-#         # Calling self.log will surface up scalars for you in TensorBoard
-#         self.log("val_loss", loss, prog_bar=True)
-#         self.log("val_acc", self.accuracy, prog_bar=True)
-#         return loss
-      
-#       def training_step(self, batch, batch_idx):
-#           x, y = batch
-#           y_hat = self.model(x)
-#           loss = F.cross_entropy(y_hat, y)
-#           pred = ...
-#           return {"loss": loss, "pred": pred}
+  print(f"Train on {str(gpus) + ' GPU' + ('s' if gpus > 1 else '') if gpus > 0  else 'CPU'}:")
+  print(f" - max epoch count: {MAX_EPOCH_COUNT}\n - batch size: {BATCH_SIZE}\n - steps per epoch: {STEPS_PER_EPOCH}\n - sample size: {SAMPLE_SIZE}")
+  print(f" - early stopping delta: {EARLY_STOP_MIN_DELTA}\n - start time: {start.strftime('%Y-%m-%d %H:%M:%S')}")
+  print("\n======================\n")
+  
+  # Use check_on_train_epoch_end=True to evaluate at the end of each epoch
+  stopping_callback = EarlyStopping(monitor="val_loss", min_delta=EARLY_STOP_MIN_DELTA, patience=EARLY_STOP_PATIENCE, verbose=True, mode='min', check_on_train_epoch_end=True)
+  callbacks = [stopping_callback]
+  
+  # You could also use an additinal progress bar but default progress reporting was sufficient. Uncomment next line if desired
+  # callbacks.append(TQDMProgressBar(refresh_rate=STEPS_PER_EPOCH, process_position=0))
+  
+  # We could use `on_train_batch_start` to control epoch sizes as shown in the link below but it's cleaner when done here with `limit_train_batches` parameter
+  # https://pytorch-lightning.readthedocs.io/en/stable/_modules/pytorch_lightning/core/hooks.html#ModelHooks.on_train_batch_start
+  trainer = pl.Trainer(
+      gpus=gpus, 
+      max_epochs=MAX_EPOCH_COUNT,
+      limit_train_batches=STEPS_PER_EPOCH,  # this is the way to end the epoch, otherwise they will continue forever because the Train dataloader is producing infinite number of batches
+      log_every_n_steps=1,
+      val_check_interval=STEPS_PER_EPOCH,  # this value must be the same as `limit_train_batches`
+      num_sanity_val_steps=0,  # this must be zero to prevent a Petastorm error about Data Loader not being read completely
+      limit_val_batches=1,  # any value would work here but there is point in validating on repeated set of data so this should be smaller than total number of batches in Validation dataset
+      reload_dataloaders_every_n_epochs=1,  # need to set this to 1
+      strategy=strategy,
+      callbacks=callbacks
+  )
 
-#https://pytorch-lightning.readthedocs.io/en/stable/_modules/pytorch_lightning/core/lightning.html#LightningModule.validation_epoch_end
-#       def training_step_end(self, batch_parts):
-#           # predictions from each GPU
-#           predictions = batch_parts["pred"]
-#           # losses from each GPU
-#           losses = batch_parts["loss"]
+  model = LitClassificationModel(train_converter, val_converter, device_id=device_id, device_count=device_count, logging_level=logging_level)
+  trainer.fit(model)
 
-#           gpu_0_prediction = predictions[0]
-#           gpu_1_prediction = predictions[1]
-
-#           # do something with both outputs
-#           return (losses[0] + losses[1]) / 2
-
-
-#       def training_epoch_end(self, training_step_outputs):
-#           for out in training_step_outputs:
+  report_duration(f"Training", start)
+  
+  return model
 
 # COMMAND ----------
 
@@ -304,75 +389,30 @@ class LitClassificationModel(pl.LightningModule):
 
 # COMMAND ----------
 
-start = dt.datetime.now()
-
-trainer = pl.Trainer(
-    gpus=0,
-    max_epochs=EPOCH_COUNT,
-    progress_bar_refresh_rate=20,
-    reload_dataloaders_every_n_epochs=1,  # Need this, otherwise process will fail trying to sample from closed DataLoader
-)
-
-lit_model = LitClassificationModel(train_sample_converter, val_sample_converter)
-trainer.fit(lit_model)
-
-report_duration("CPU training", start)
-
-            
-# TODO
-#trainer.test()
+cpu_model = train(train_sample_converter, val_sample_converter, gpus=0)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC 
-# MAGIC #### Some extra feedback on what's done so far
+# MAGIC #### CPU Training Results
 # MAGIC 
-# MAGIC ***Few surprise discoveries here***
-# MAGIC 1. Must set `num_epochs=1` in the call to `make_torch_dataloader` otherwise the loader will keep on going forever as if it was set to `None`
-# MAGIC     - default value is `None` (though in `https://github.com/uber/petastorm/blob/master/petastorm/reader.py` it's `1`)
-# MAGIC     - from docs: ```:param num_epochs: An epoch is a single pass over all rows in the
-# MAGIC             dataset. Setting `num_epochs` to `None` will result in an
-# MAGIC             infinite number of epochs.```
-# MAGIC     - effectively, this means setting `num_epochs=None` will result in never-ending training even if using `EPOCH_COUNT=1`
-# MAGIC     - don't set it to `EPOCH_COUNT` as it will result `EPOCH_COUNT` * `batch_count` number of batches for each epoch, as opposed to expected `batch_count` (`batch_count = record_count / BATCH_SIZE`)
-# MAGIC 1. Even with `num_epochs=1`, if training for multiple epochs then only a first epoch seem to be getting a correct record count with last incomplete batch size doubling for each epoch
-# MAGIC     - *Example: training with BATCH_SIZE=64 and total of 92 records*
-# MAGIC         - training for 1 epoch
-# MAGIC             - epoch 0
-# MAGIC                 - batch 0: 64 records
-# MAGIC                 - batch 1: 28 records <- OK
-# MAGIC         - training for 2 epochs
-# MAGIC             - epoch 0
-# MAGIC                 - batch 0: 64 records
-# MAGIC                 - batch 1: 28 records
-# MAGIC             - epoch 1 (extra 28 records)
-# MAGIC                 - batch 2: 64 records
-# MAGIC                 - batch 3: 56 records <-- Doubled (+28)
-# MAGIC         - training for 3 epochs
-# MAGIC             - *exactly like epochs 0 and 1 from training with 2 epochs*
-# MAGIC             - epoch 2
-# MAGIC                 - batch 4: 64 records
-# MAGIC                 - batch 5: 64 records  <-- 56+8
-# MAGIC                 - batch 6: 20 records  <-- +20 (spill from +28 to previous batch)
-# MAGIC         - training for 4 epochs
-# MAGIC             - *exactly like epochs 0, 1 and 2 from training with 3 epochs*
-# MAGIC             - epoch 3
-# MAGIC                 - batch 7: 64 records
-# MAGIC                 - batch 8: 48 records  <-- this looks like 20+28 but where is second batch of 64 gone?    
-# MAGIC     - *This pattern of adding 28 to the last batch continues for subsequent epochs if larger number of epochs is used for training*
-# MAGIC         - as can be seen in training with 4 epochs, there are some occational drops of previosly used by overfilled batches
-# MAGIC     - A fix: reset the dataset on every epoch, but that's not a straightforward process because `make_torch_dataloader` returns a Context Manager, so
-# MAGIC         - opt 1 - ignore a reset and train with some non-expected extra data (though this will likely result in context manager not cleaning up properly), e.g. `trainer.fit(lit_model, converter_train.make_torch_dataloader(transform_spec=get_transform_spec(is_train=True), num_epochs=1, batch_size=BATCH_SIZE).__enter__())`
-# MAGIC         - [IMPLEMENTED] option 2 - call `__enter__` explicitly on the Context Manager
-# MAGIC           
-# MAGIC This also works but no way to control resetting
-# MAGIC ```
-# MAGIC with converter_train.make_torch_dataloader(transform_spec=get_transform_spec(is_train=True), num_epochs=1, batch_size=BATCH_SIZE) as train_loader:
-# MAGIC     trainer.fit(lit_model, train_loader)~
-# MAGIC ```
+# MAGIC 1: Train on CPU:
+# MAGIC  - max epoch count: 15
+# MAGIC  - batch size: 64
+# MAGIC  - steps per epoch: 15
+# MAGIC  - sample size: 1000
+# MAGIC  - early stopping delta: 0.05
+# MAGIC  - start time: 2022-01-07 17:39:26
 # MAGIC 
-# MAGIC https://github.com/uber/petastorm/blob/master/petastorm/spark/spark_dataset_converter.py
+# MAGIC ======================
+# MAGIC 
+# MAGIC Epoch: 12
+# MAGIC Monitored metric val_loss did not improve in the last 3 records. Best score: 0.374. Signaling Trainer to stop.
+# MAGIC 
+# MAGIC -- Training completed in ***6 minutes 49 seconds*** at 2022-01-07 17:46:15
+# MAGIC   
+# MAGIC ----------------------
 
 # COMMAND ----------
 
@@ -382,62 +422,96 @@ report_duration("CPU training", start)
 
 # COMMAND ----------
 
-import horovod.torch as hvd
-from pytorch_lightning.plugins.training_type.horovod import HorovodPlugin
-# from sparkdl import HorovodRunner
-
-# COMMAND ----------
-
-def train_hvd(gpus=1):
-  print(f"--> Train with Horovod using {gpus} GPUs")
-  start = dt.datetime.now()
-
-  trainer = pl.Trainer(
-      gpus=gpus, 
-      max_epochs=EPOCH_COUNT,
-      progress_bar_refresh_rate=20,
-      reload_dataloaders_every_n_epochs=1,
-      strategy=HorovodPlugin()
-  )
-
-  model = LitClassificationModel(train_sample_converter, val_sample_converter)
-  trainer.fit(model)
-
-  report_duration(f"Training with {gpus} GPUs", start)
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC 
 # MAGIC #### Using 1 GPU
-
-# COMMAND ----------
-
-train_hvd()
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC 
-# MAGIC #### Using 4 GPUs
+# MAGIC ***Note:** This section will require a cluster with a GPU. A single node cluster with a single GPU instance will suffice (e.g. `p3.2xlarge` on AWS or equivalent on other cloud providers)*
 
 # COMMAND ----------
 
-# This will still run on a single GPU
-
-train_hvd(4)
+train(train_sample_converter, val_sample_converter, gpus=1)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC 
-# MAGIC ### Multi-GPU Training
+# MAGIC #### GPU Training Results
 # MAGIC 
-# MAGIC Looks like simply passing number of desired GPUs to use to `gpus` paramerer of the trainer doesn't really work as expected as the trainer seem to be still using only one GPU. 
+# MAGIC 1: Train on 1 GPU:
+# MAGIC  - max epoch count: 15
+# MAGIC  - batch size: 64
+# MAGIC  - steps per epoch: 15
+# MAGIC  - sample size: 1000
+# MAGIC  - early stopping delta: 0.05
+# MAGIC  - start time: 2022-01-07 17:48:14
 # MAGIC 
-# MAGIC In order to make it work with multiple GPUs, need to use `horovod` runner
+# MAGIC ======================
 # MAGIC 
-# MAGIC - https://github.com/PyTorchLightning/pytorch-lightning/blob/1fc046cde28684316323693dfca227dbd270663f/tests/models/test_horovod.py
+# MAGIC Epoch: 12
+# MAGIC Monitored metric val_loss did not improve in the last 3 records. Best score: ***0.399***. Signaling Trainer to stop.
+# MAGIC 
+# MAGIC -- Training completed in ***4 minutes 34 seconds*** at 2022-01-07 17:52:48
+# MAGIC 
+# MAGIC ---------------------
+# MAGIC 
+# MAGIC ***Observations:*** full training/validation cycle on GPU is faster than CPU but not by much, whereas benchmarks training runs without validation showed more that 3 times speedup on GPU*
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC #### Using multiple GPUs
+# MAGIC 
+# MAGIC ***Note:** This section will require a cluster with multiple GPUs (a single node cluster with multiple GPUs instace will suffice (e.g. p3.8xlarge on AWS or equivalent on other cloud providers). **However, given this code does not really work there is no point in launching a cluster for it***
+# MAGIC 
+# MAGIC Simply passing a value of `gpus` parameter greater than 1 throws an error (e.g. `train(gpus=4)`). This could due to it running in `ddp_spawn` mode (documentation says `If you request multiple GPUs or nodes without setting a mode, DDP Spawn will be automatically used.` [https://pytorch-lightning.readthedocs.io/en/stable/advanced/multi_gpu.html#distributed-modes]) 
+# MAGIC 
+# MAGIC To use more than 1 GPU in Trainer we need to specify a strategy, e.g. `strategy=HorovodPlugin()`, but it produces the same loss within the same execution time as when using a single GPU, which draws a conclusion that only a single GPU gets used anyways. (this is also supported by output logs from only one process in verbose logging mode, but that could be because logging in other processes spawned for GPUs other then the 1st GPU are not shown in this process)
+# MAGIC 
+# MAGIC ***Note/TODO:*** strangely, it complains about interactive mode if using `strategy="horovod"` but works with `strategy=HorovodPlugin()`. Maybe using an instance of DDP plugin instead of `strategy="ddp"` will also work, worth checking.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC ### Distributed Training
+# MAGIC 
+# MAGIC Since we are using PyTorch here, PyTorch DDP (Distributed Data Parallel) would be a logical choice for scaling out the training to multiple GPUs (as opposed to DP which not recommended by PyTorch), but DDP does not work in interactive mode (e.g. notebooks) so it would have to be executed as a standalone script (which in turn seems to be problematic due to missing Spark context on standalone script executed in Notebook). Furthermore, I don't know if I'll be able to use Petastorm with DDP (DDP itself does splitting and distribution of the data, I doubt it works on top of Petastom Spark Converter - something here to review: https://github.com/PyTorchLightning/pytorch-lightning/issues/5074) 
+# MAGIC 
+# MAGIC Then there is Horovod which works in interactive mode (e.g. Notebooks), which brings the following options to explore:
+# MAGIC 
+# MAGIC 1. PyTorch Lightning has a `HorovodPlugin` plugin, we can use it with a `horovod` runner
+# MAGIC     - https://pytorch-lightning.readthedocs.io/en/stable/_modules/pytorch_lightning/plugins/training_type/horovod.html
+# MAGIC     - https://github.com/PyTorchLightning/pytorch-lightning/blob/1fc046cde28684316323693dfca227dbd270663f/tests/models/test_horovod.py
+# MAGIC     - looks like pretty easy to run on a single node but how about multi-node - do I need to do some further configurations or will `horovod` have it automatically because it's pre-installed?
+# MAGIC     - similar to using `sparkdl.HorovodRunner`, I'll end up with a model per GPU and would have to consolidate
+# MAGIC     - *an interesting observation, using `strategy="horovod"` without using the `horovod` runner complains about interactive mode but `strategy=HorovodPlugin()` does not*
+# MAGIC 1. Use `horovod.torch as hvd` with `sparkdl.HorovodRunner`
+# MAGIC     - https://demo.cloud.databricks.com/#notebook/10513096/command/10513118
+# MAGIC     - `sparkdl.HorovodRunner` will "understand" a Spark cluster so no need to configure the additional cluster settings
+# MAGIC     - I'll have to use multiple Trainer objects, one per GPU, which means I will end up with multiple models each trained on sub-set of data provided by Petastorm which in turn means Id have to consolidate the weights myself
+# MAGIC 1. Use `horovod.spark.lightning` as `hvd` with `hvd.TorchEstimator` and `horovod.spark.common.backend.SparkBackend`
+# MAGIC     - https://github.com/horovod/horovod/blob/master/examples/spark/pytorch/pytorch_lightning_spark_mnist.py
+# MAGIC     - this is Spark "aware", no need to furher configure clusters
+# MAGIC     - SparkBackend does splitting of a given dataset into multiple jobs, can I use a tiny fake dataset to do the splitting but still train using Petastorm? Do I have access to information on what device each process is running on?
+# MAGIC     
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC #### Use Horovod runner
+# MAGIC 
+# MAGIC ***Note:** This section will require a cluster with multiple GPUs, a single node cluster with multiple GPUs instace will be sufficient (e.g. p3.8xlarge on AWS or equivalent on other cloud providers)*
+# MAGIC 
+# MAGIC To get the most out of distributed training we need to train each model on its own subset of data/batch, this is done by sharding the Petastorm batches into the number of GPUs we use. For that to work, Spark dataframe must also have least as many partitions as the number of devices we use.
+# MAGIC 
+# MAGIC To simplify things we'll only train on a subset of avaialable GPUs
+
+# COMMAND ----------
+
+DEVICE_COUNT = 2
 
 # COMMAND ----------
 
@@ -446,32 +520,94 @@ if _HOROVOD_AVAILABLE:
   print("Horovod is available")
   import horovod
   import horovod.torch as hvd
-  hvd.init()
-
-# COMMAND ----------
-
-def train_hvd_one():
-  hvd.init()
-  print(f"--> hvd.rank(): {hvd.rank()}, hvd.size(): {hvd.size()}")
-  start = dt.datetime.now()
-
-  trainer = pl.Trainer(
-      gpus=1, 
-      max_epochs=EPOCH_COUNT,
-      progress_bar_refresh_rate=20,
-      reload_dataloaders_every_n_epochs=1,
-      strategy="horovod"
-  )
-
-  model = LitClassificationModel(train_sample_converter, val_sample_converter)
-  trainer.fit(model)
-
-  report_duration(f"Device {hvd.rank()}", start)
+  from pytorch_lightning.plugins.training_type.horovod import HorovodPlugin
+  print(f"Horovod: {horovod.__version__}")
 
 
 # COMMAND ----------
 
-horovod.run(train_hvd_one, np=2)
+train_partitioned_converter, val_partitioned_converter = create_spark_converters(True, DEVICE_COUNT)
+
+# COMMAND ----------
+
+def train_hvd():
+  hvd.init()
+  train(train_converter=train_partitioned_converter, val_converter=val_partitioned_converter, gpus=1, strategy="horovod", device_id=hvd.rank(), device_count=hvd.size())
+
+# COMMAND ----------
+
+horovod.run(train_hvd, np=DEVICE_COUNT)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC #### 2 GPU on Single Node Training Results
+# MAGIC 
+# MAGIC 1: 
+# MAGIC [1,1]<stdout>:Train on 1 GPU:
+# MAGIC [1,1]<stdout>: - max epoch count: 15
+# MAGIC [1,1]<stdout>: - batch size: 64
+# MAGIC [1,1]<stdout>: - steps per epoch: 15
+# MAGIC [1,1]<stdout>: - sample size: 1000
+# MAGIC [1,1]<stdout>: - early stopping delta: 0.05
+# MAGIC [1,1]<stdout>: - start time: 2022-01-07 18:54:39
+# MAGIC [1,1]<stdout>:
+# MAGIC [1,1]<stdout>:======================
+# MAGIC [1,1]<stdout>:
+# MAGIC [1,0]<stdout>:Train on 1 GPU:
+# MAGIC [1,0]<stdout>: - max epoch count: 15
+# MAGIC [1,0]<stdout>: - batch size: 64
+# MAGIC [1,0]<stdout>: - steps per epoch: 15
+# MAGIC [1,0]<stdout>: - sample size: 1000
+# MAGIC [1,0]<stdout>: - early stopping delta: 0.05
+# MAGIC [1,0]<stdout>: - start time: 2022-01-07 18:54:39
+# MAGIC [1,0]<stdout>:
+# MAGIC [1,0]<stdout>:======================
+# MAGIC   
+# MAGIC Epoch 8: 100% 16/16 [00:16<00:00,  1.04s/it, loss=0.33, v_num=0, train_loss=0.295, val_loss=0.337, val_acc=0.910][1,0]<stdout>:
+# MAGIC [1,1]<stderr>:[rank: 1] Monitored metric val_loss did not improve in the last 3 records. Best score: 0.378. Signaling Trainer to stop.
+# MAGIC [1,0]<stderr>:[rank: 0] Monitored metric val_loss did not improve in the last 3 records. Best score: 0.378. Signaling Trainer to stop.
+# MAGIC Epoch 8: 100% 16/16 [00:16<00:00,  1.05s/it, loss=0.33, v_num=0, train_loss=0.295, val_loss=0.337, val_acc=0.910][1,0]<stdout>:
+# MAGIC [1,1]<stdout>:
+# MAGIC [1,1]<stdout>:-- Training completed in ***3 minutes 23 seconds*** at 2022-01-07 22:20:30
+# MAGIC [1,1]<stdout>:
+# MAGIC [1,1]<stdout>:---------------------
+# MAGIC [1,0]<stdout>:
+# MAGIC [1,0]<stdout>:-- Training completed in ***3 minutes 23 seconds*** at 2022-01-07 22:20:30
+# MAGIC [1,0]<stdout>:
+# MAGIC [1,0]<stdout>:---------------------
+# MAGIC 
+# MAGIC ***Observations:*** 
+# MAGIC   - we get a better training time than single GPU training
+# MAGIC   - [TODO] maybe need to switch to step level score
+# MAGIC   - [INTERESTING] running on 2 GPUs seem to give a better loss than we can achieve using the same dataset on 1 GPU. It gets even better if we increase the number of GPUs to 4 (<= 0.3 on each GPU). 
+# MAGIC       - this could a result of optimiser/loss syncronisation between different Trainer instances
+# MAGIC   - I can see this `Epoch 4: : 20it [00:05,  3.39it/s, loss=0.468, v_num=11]` in the logs I have not seen before, this looks like a progress bar but I wasn't seeng that before when using a CPU or single GPU, why?
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC #### Use `sparkdl.HorovodRunner`
+# MAGIC 
+# MAGIC https://databricks.com/notebooks/computer-vision/cv_03_%20model_training.html
+
+# COMMAND ----------
+
+from sparkdl import HorovodRunner
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC #### Use `TorchEstimator` with `SparkBackend`
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC #### Adjust data loading for multi-GPU training
 
 # COMMAND ----------
 
@@ -490,13 +626,16 @@ horovod.run(train_hvd_one, np=2)
 
 # COMMAND ----------
 
-
+# MAGIC %md
+# MAGIC 
+# MAGIC ### Clean Up
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC 
-# MAGIC # Appendix
+train_sample_converter.delete()
+val_sample_converter.delete()
+train_partitioned_converter.delete()
+val_partitioned_converter.delete()
 
 # COMMAND ----------
 
@@ -530,434 +669,86 @@ trainer.fit(lit_model)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC 
-# MAGIC ### Single Node Training and Validation
-
-# COMMAND ----------
-
-# Check the selected model structure
-#model = torchvision.models.mobilenet_v2(pretrained=True)
-#model
-
-# COMMAND ----------
-
-def train(model, criterion, optimizer, scheduler, data_loader, device, batch_count, batch_size=BATCH_SIZE):
-  model.train()  # Set model to training mode
-
-  # statistics
-  running_loss = 0.0
-  running_corrects = 0
-
-  # Iterate over the data for one epoch.
-  for step in range(batch_count):
-    batch = next(data_loader)
-    X, y = batch['features'].to(device), batch['cls_id'].to(device)
-    
-    # Track history in training
-    with torch.set_grad_enabled(True):
-      
-      # zero the parameter gradients
-      optimizer.zero_grad()
-
-      # forward
-      outputs = model(X)
-      _, preds = torch.max(outputs, 1)
-      loss = criterion(outputs, y)
-
-      # backward + optimize
-      loss.backward()
-      optimizer.step()
-
-    # statistics
-    running_loss += loss.item() * X.size(0)
-    running_corrects += torch.sum(preds == y.data)
-  
-  scheduler.step()
-
-  loss = running_loss / (batch_count * batch_size)
-  acc = running_corrects.double() / (batch_count * batch_size)
-
-  print('- Train: loss: {:.4f}, acc: {:.4f}'.format(loss, acc))
-  return loss, acc
-
-def eval(model, criterion, data_loader, device, batch_count, batch_size=BATCH_SIZE, metric_agg_fn=None):
-  model.eval()  # Set model to evaluate mode
-
-  # statistics
-  running_loss = 0.0
-  running_corrects = 0
-
-  # Iterate over all the validation data.
-  for step in range(batch_count):
-    batch = next(data_loader)
-    X, y = batch['features'].to(device), batch['cls_id'].to(device)
-
-    # Do not track history in evaluation to save memory
-    with torch.set_grad_enabled(False):
-      # forward
-      outputs = model(X)
-      _, preds = torch.max(outputs, 1)
-      loss = criterion(outputs, y)
-
-    # statistics
-    running_loss += loss.item()
-    running_corrects += torch.sum(preds == y.data)
-  
-  # Average the losses across observations for each minibatch.
-  loss = running_loss / batch_count
-  acc = running_corrects.double() / (batch_count * batch_size)
-  
-  # metric_agg_fn is used in the distributed training to aggregate the metrics on all workers
-  if metric_agg_fn is not None:
-    loss = metric_agg_fn(loss, 'avg_loss')
-    acc = metric_agg_fn(acc, 'avg_acc')
-
-  print('- Validation - loss: {:.4f}, acc: {:.4f}'.format(loss, acc))
-
-  return loss, acc
-
-# COMMAND ----------
-
-def train_and_eval(class_count=CLASS_COUNT, lr=LR, batch_size=BATCH_SIZE):
-  device = torch.device("cuda" if GPUS else "cpu")
-  
-  model = get_model(class_count, lr).to(device)
-  criterion = torch.nn.CrossEntropyLoss()
-
-  # Only parameters of final layer are being optimized.
-  optimizer = torch.optim.SGD(model.classifier[1].parameters(), lr=lr, momentum=0.9)
-
-  # Decay LR by a factor of 0.1 every 7 epochs
-  exp_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-  
-  with converter_train.make_torch_dataloader(transform_spec=get_transform_spec(is_train=True), 
-                                             batch_size=BATCH_SIZE) as train_dl, \
-       converter_val.make_torch_dataloader(transform_spec=get_transform_spec(is_train=False), 
-                                           batch_size=BATCH_SIZE) as val_dl:
-    
-    train_data_loader = iter(train_dl)
-    train_batch_count = len(converter_train) // BATCH_SIZE
-    
-    val_data_loader = iter(val_dl)
-    val_batch_count = max(1, len(converter_val) // BATCH_SIZE)
-    
-    for epoch in range(EPOCHS):
-      print('-' * 10)
-      print('Epoch {:>3}/{}'.format(epoch + 1, EPOCHS))
-      
-
-      train_loss, train_acc = train(model, criterion, optimizer, exp_lr_scheduler, train_data_loader, device, train_batch_count) 
-      val_loss, val_acc = eval(model, criterion, val_data_loader, device, val_batch_count)
-
-  return val_loss
-
-# COMMAND ----------
-
-# Uncomment this to run the base local training
-
-# loss = train_and_eval()
+# MAGIC %md 
+# MAGIC # Appendix
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC 
-# MAGIC # Playground
+# MAGIC #### `num_epochs` parameter of `make_torch_dataloader`
+# MAGIC 
+# MAGIC https://github.com/uber/petastorm/blob/master/petastorm/spark/spark_dataset_converter.py
+# MAGIC 
+# MAGIC If setting `num_epochs=1` and  training for multiple epochs then only a first epoch seem to be getting a correct number of records within an epoch, with last incomplete batch size doubling for each epoch
+# MAGIC 
+# MAGIC Example: training with BATCH_SIZE=64 and 92 records in training dataset
+# MAGIC     - training for 1 epoch
+# MAGIC         - epoch 0
+# MAGIC             - batch 0: 64 records
+# MAGIC             - batch 1: 28 records <- OK
+# MAGIC     - training for 2 epochs
+# MAGIC         - epoch 0
+# MAGIC             - batch 0: 64 records
+# MAGIC             - batch 1: 28 records
+# MAGIC         - epoch 1 (extra 28 records)
+# MAGIC             - batch 2: 64 records
+# MAGIC             - batch 3: 56 records <-- Doubled (+28)
+# MAGIC     - training for 3 epochs
+# MAGIC         - *exactly like epochs 0 and 1 from training with 2 epochs*
+# MAGIC         - epoch 2
+# MAGIC             - batch 4: 64 records
+# MAGIC             - batch 5: 64 records  <-- 56+8
+# MAGIC             - batch 6: 20 records  <-- +20 (spill from +28 to previous batch)
+# MAGIC     - training for 4 epochs
+# MAGIC         - *exactly like epochs 0, 1 and 2 from training with 3 epochs*
+# MAGIC         - epoch 3
+# MAGIC             - batch 7: 64 records
+# MAGIC             - batch 8: 48 records  <-- this looks like 20+28 but where is second batch of 64 gone? 
+# MAGIC             
+# MAGIC *This pattern of adding 28 to the last batch continues for subsequent epochs if larger number of epochs is used for training*
+# MAGIC 
+# MAGIC As can be seen in training with 4 epochs, there are also some occational drops of previosly used by overfilled batches
+# MAGIC 
+# MAGIC A fix is to reset the dataset on every epoch, but that's not a straightforward process because `make_torch_dataloader` returns a Context Manager, so cannot use the `with converter_train.make_torch_dataloader(...)` in the `train_dataloader` as it destroys the context on exit which means taking the data loader outside the lightning model class. We chose explicitly calling `__enter__` explicitly on the Context Manager within the model
+# MAGIC           
 
 # COMMAND ----------
 
-class LitModelDistributed(pl.LightningModule):
-    def __init__(self, data_dir=DATA_DIR, class_count=CLASS_COUNT, lr=LR):
-        super().__init__()
-        self.lr = lr
-        self.model = get_model(class_count, lr)
-        self.train_dataloader_context = None
-        self.state = {"epochs": 0, "batches": 0}
-        self.base_optimiser = torch.optim.SGD(self.model.classifier[1].parameters(), lr=self.lr * hvd.size(), momentum=0.9)
-        
-    def configure_optimizers(self):
-        return hvd.DistributedOptimizer(self.base_optimiser, named_parameters=self.model.named_parameters())
-    
-    def forward(self, x):
-        x = self.model(x)
-        return x
-      
-    def training_step(self, batch, batch_idx):
-        X, y = batch['features'], batch['cls_id']
-        pred = self(X)
-        loss = F.cross_entropy(pred, y)
-        acc = FM.accuracy(pred, y)
-        print(f'\t - batch_idx: {batch_idx}, ({len(y)})')
-        print(f'\t - loss: {loss}, acc: {acc}')
-        return loss
-
-    def on_epoch_start(self):
-        print(f"--> Epoch: {self.state['epochs']}")
-        self.state["epochs"] += 1
-        
-        # First epoch will already have data loader
-        if self.state["epochs"] > 1:
-          # Need to explicity Enter the context, trainer does not seem to be able to work with a context
-          self.trainer.train_dataloader = self.train_dataloader()
-    
-    def on_epoch_end(self):
-        # Need to reset DataLoader on each epoch. ContextManager is stored in this class, not in `trainer`, destroy it. If new one is needed,
-        # it will be created at the start of next epoch
-        self.train_dataloader_context.__exit__(None, None, None)
-      
-    def train_dataloader(self):
-        self.train_dataloader_context = converter_train.make_torch_dataloader(transform_spec=get_transform_spec(is_train=True), num_epochs=1, cur_shard=hvd.rank(), shard_count=hvd.size(), batch_size=BATCH_SIZE)
-        return self.train_dataloader_context.__enter__()
-
+# MAGIC %md
+# MAGIC 
+# MAGIC #### Test `mpi`
 
 # COMMAND ----------
 
-def train_and_evaluate_hvd(lr=LR):
-  hvd.init()  # Initialize Horovod.
-  
-  # Horovod: pin GPU to local rank.
-  if torch.cuda.is_available():
-    torch.cuda.set_device(hvd.local_rank())
-    device = torch.cuda.current_device()
-  else:
-    device = torch.device("cpu")
-  
-#   trainer = pl.Trainer(
-#     gpus=GPUS,
-#     max_epochs=EPOCH_COUNT,
-#     progress_bar_refresh_rate=20,
-#     reload_dataloaders_every_n_epochs=1,  # Need this, otherwise process will fail trying to sample from closed DataLoader
-#   )
+script = """#include <mpi.h>
+#include <stdio.h>
 
-  model = LitModelDistributed()
-  
-  # Broadcast initial parameters so all workers start with the same parameters.
-  hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-  hvd.broadcast_optimizer_state(model.base_optimiser, root_rank=0)
+int main(int argc, char *argv[])
+{
+    int size, rank;
 
-#   trainer.fit(lit_model)
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-# COMMAND ----------
+    printf("Hello\\n");
 
-# hr = HorovodRunner(np=1)   
-# hr.run(train_and_evaluate_hvd)
+    MPI_Finalize();
 
-# COMMAND ----------
+    return 0;
+}"""
 
-# MAGIC %pip install deepspeed
-
-# COMMAND ----------
-
-# MAGIC %sh
-# MAGIC ls -la /tmp
-
-# COMMAND ----------
-
-# MAGIC %sh
-# MAGIC env
-
-# COMMAND ----------
-
-script = """
-import io
-import numpy as np
-from functools import partial
-
-from PIL import Image
-
-import torch, torchvision
-from torch import nn
-import torch.nn.functional as F
-import torchmetrics.functional as FM
-from torchmetrics import Accuracy
-from torch.utils.data import DataLoader, random_split
-from torchvision import transforms
-import pytorch_lightning as pl
-
-from pyspark.sql.functions import col
-from pyspark.sql.types import LongType
-
-from petastorm import TransformSpec
-from petastorm.spark import SparkDatasetConverter, make_spark_converter
-
-from pyspark.conf import SparkConf
-from pyspark.context import SparkContext
-
-
-
-conf = SparkConf()
-conf.setAppName("Databricks Shell")
-conf.setMaster("local[*, 4]").setAppName("Databricks Shell")
-#sc = SparkContext.getOrCreate(conf=conf)
-
-#sc = SparkContext.getOrCreate()
-
-from pyspark.sql import SparkSession
-spark = SparkSession.builder.config(conf=conf).getOrCreate()
-
-DATA_DIR = '/databricks-datasets/flowers/delta'
-GPUS = min(1, torch.cuda.device_count())
-BATCH_SIZE = 256 if GPUS else 64
-EPOCH_COUNT = 3
-DATA_SET_LIMIT = 100
-WORKER_COUNT = 1
-LR = 0.001
-CLASS_COUNT = 5
-
-df = spark.read.format("delta").load(DATA_DIR).select(["content", "label"]).limit(DATA_SET_LIMIT)
-classes = list(df.select("label").distinct().toPandas()["label"])
-
-# Add a numeric class colunmn
-def to_class_index(class_name):
-  return classes.index(class_name)
-
-class_index = udf(to_class_index, LongType())
-df = df.withColumn("cls_id", class_index(col("label"))).drop("label")
-
-df_train, df_val = df.randomSplit([0.9, 0.1], seed=12345)
-
-# Make sure the number of partitions is at least the number of workers which is required for distributed training.
-df_train = df_train.repartition(WORKER_COUNT)
-df_val = df_val.repartition(WORKER_COUNT)
-
-print(f'Loaded {df.count()} records (train: {df_train.count()}, val: {df_val.count()})')
-print(f'Labels ({CLASS_COUNT}): {classes}')
-
-# Set a cache directory on DBFS FUSE for intermediate data.
-CACHE_DIR = "file:///dbfs/tmp/petastorm/cache"
-spark.conf.set(SparkDatasetConverter.PARENT_CACHE_DIR_URL_CONF, CACHE_DIR)
-
-converter_train = make_spark_converter(df_train)
-converter_val = make_spark_converter(df_val)
-
-def get_model(class_count, lr):
-  model = torchvision.models.mobilenet_v2(pretrained=True)
-  
-  # Freeze parameters in the feature extraction layers and replace the last layer
-  for param in model.parameters():
-    param.requires_grad = False
-
-  # New modules have `requires_grad = True` by default
-  model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, class_count)
-  
-  return model
-
-def transform_row(is_train, batch):
-  transformers = [transforms.Lambda(lambda x: Image.open(io.BytesIO(x)))]
-  if is_train:
-    transformers.extend([
-      transforms.RandomResizedCrop(224),
-      transforms.RandomHorizontalFlip(),
-    ])
-  else:
-    transformers.extend([
-      transforms.Resize(256),
-      transforms.CenterCrop(224),
-    ])
-  transformers.extend([
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-  ])
-  
-  trans = transforms.Compose(transformers)
-  
-  batch['features'] = batch['content'].map(lambda x: trans(x).numpy())
-  batch = batch.drop(labels=['content'], axis=1)
-  return batch
-
-def get_transform_spec(is_train=True):
-  # The output shape of the `TransformSpec` is not automatically known by petastorm, 
-  # so you need to specify the shape for new columns in `edit_fields` and specify the order of 
-  # the output columns in `selected_fields`.
-  return TransformSpec(partial(transform_row, is_train), 
-                       edit_fields=[('features', np.float32, (3, 224, 224), False)], 
-                       selected_fields=['features', 'cls_id'])
-
-class LitModel(pl.LightningModule):
-    def __init__(self, data_dir=DATA_DIR, class_count=CLASS_COUNT, lr=LR):
-        super().__init__()
-        self.lr = lr
-        self.model = get_model(class_count, lr)
-        self.train_dataloader_context = None
-        self.state = {"epochs": 0, "batches": 0}
-        
-    def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.model.classifier[1].parameters(), lr=self.lr, momentum=0.9)
-        return optimizer
-    
-    def forward(self, x):
-        x = self.model(x)
-        return x
-      
-    def training_step(self, batch, batch_idx):
-        X, y = batch['features'], batch['cls_id']
-        pred = self(X)
-        loss = F.cross_entropy(pred, y)
-        acc = FM.accuracy(pred, y)
-        print(f'\t - batch_idx: {batch_idx}, ({len(y)})')
-        print(f'\t - loss: {loss}, acc: {acc}')
-        return loss
-
-    def on_epoch_start(self):
-        print(f"--> Epoch: {self.state['epochs']}")
-        self.state["epochs"] += 1
-        
-        # First epoch will already have data loader
-        if self.state["epochs"] > 1:
-          # Need to explicity Enter the context, trainer does not seem to be able to work with a context
-          self.trainer.train_dataloader = self.train_dataloader()
-    
-    def on_epoch_end(self):
-        # Need to reset DataLoader on each epoch. ContextManager is stored in this class, not in `trainer`, destroy it. If new one is needed,
-        # it will be created at the start of next epoch
-        self.train_dataloader_context.__exit__(None, None, None)
-      
-    def train_dataloader(self):
-        self.train_dataloader_context = converter_train.make_torch_dataloader(transform_spec=get_transform_spec(is_train=True), num_epochs=1, batch_size=BATCH_SIZE)
-        return self.train_dataloader_context.__enter__()
-      
-trainer = pl.Trainer(
-    gpus=GPUS, 
-    max_epochs=EPOCH_COUNT,
-    progress_bar_refresh_rate=20,
-    reload_dataloaders_every_n_epochs=1,  # Need this, otherwise process will fail trying to sample from closed DataLoader
-    strategy="deepspeed_stage_1"
-)
-
-lit_model = LitModel()
-trainer.fit(lit_model)
-"""
-  
-
-# COMMAND ----------
-
-script_path = "/tmp/train.py"
-with open(script_path, "w") as fout:
+exe_path = "test_mpi.c"
+with open(exe_path, "w") as fout:
   fout.write(script)
 
 # COMMAND ----------
 
 # MAGIC %sh
-# MAGIC #/databricks/python/bin/pip install pytorch_lightning
-
-# COMMAND ----------
-
-# MAGIC %sh
 # MAGIC 
-# MAGIC /databricks/python3/bin/python3 /tmp/train.py
-
-# COMMAND ----------
-
-from pyspark.context import SparkContext
-from pyspark.sql.session import SparkSession
-sc = SparkContext.getOrCreate()
-
-
-# COMMAND ----------
-
-sc.getConf().get("spark.master")
-# sc.getConf().get("spark.app.name")
-
+# MAGIC mpicc -o test_mpi test_mpi.c
+# MAGIC mpirun --allow-run-as-root -np 2 ./test_mpi
 
 # COMMAND ----------
 
