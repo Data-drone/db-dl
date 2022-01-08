@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.callbacks import TQDMProgressBar
 
 from pyspark.sql.functions import col
@@ -53,6 +54,8 @@ IS_DEV = True
 DATA_DIR = "/databricks-datasets/flowers/delta"
 GPU_COUNT = torch.cuda.device_count()
 print(f"Found {GPU_COUNT if GPU_COUNT > 0 else 'no'} GPUs")
+
+MAX_DEVICE_COUNT_TO_USE = 2
 
 BATCH_SIZE = 64
 MAX_EPOCH_COUNT = 15
@@ -111,7 +114,7 @@ df = spark.read.format("delta").load(DATA_DIR).select(["label"]).limit(SAMPLE_SI
 
 # COMMAND ----------
 
-def get_data(sample_size=-1, partition_count=1):
+def get_data(sample_size=-1):
   df = spark.read.format("delta").load(DATA_DIR).select(["content", "label"])
   if sample_size > 0:
     df = df.limit(sample_size)
@@ -129,8 +132,8 @@ def get_data(sample_size=-1, partition_count=1):
   train_df, val_df = df.randomSplit([0.8, 0.2], seed=12)
 
   # For distributed training data must have at least as many many partitions as the number of devices/processes
-  train_df = train_df.repartition(partition_count)
-  val_df = val_df.repartition(partition_count)
+  train_df = train_df.repartition(MAX_DEVICE_COUNT_TO_USE)
+  val_df = val_df.repartition(MAX_DEVICE_COUNT_TO_USE)
 
   print(f"Dataset size: {df.count()} (train: {train_df.count()}, val: {val_df.count()}{'' if partition_count == 1 else ', ' + str(partition_count) + ' partitions each'})")
   print(f"Labels ({CLASS_COUNT}): {classes}")
@@ -139,8 +142,8 @@ def get_data(sample_size=-1, partition_count=1):
   
   return train_df, val_df
 
-def create_spark_converters(use_sample=True, partition_count=1):
-  train_df, val_df = get_data(SAMPLE_SIZE if use_sample else -1, partition_count)
+def create_spark_converters(use_sample=True):
+  train_df, val_df = get_data(SAMPLE_SIZE if use_sample else -1)
   return make_spark_converter(train_df), make_spark_converter(val_df)
 
 
@@ -343,18 +346,20 @@ class LitClassificationModel(pl.LightningModule):
 
 # COMMAND ----------
 
-def train(train_converter, val_converter, gpus=0, strategy=None, device_id=0, device_count=1, logging_level=logging.INFO):
+def train(train_converter=train_sample_converter, val_converter=val_sample_converter, gpus=0, strategy=None, device_id=0, device_count=1, logging_level=logging.INFO):
   
   start = dt.datetime.now()
 
   print(f"Train on {str(gpus) + ' GPU' + ('s' if gpus > 1 else '') if gpus > 0  else 'CPU'}:")
-  print(f" - max epoch count: {MAX_EPOCH_COUNT}\n - batch size: {BATCH_SIZE}\n - steps per epoch: {STEPS_PER_EPOCH}\n - sample size: {SAMPLE_SIZE}")
-  print(f" - early stopping delta: {EARLY_STOP_MIN_DELTA}\n - start time: {start.strftime('%Y-%m-%d %H:%M:%S')}")
+  print(f" - max epoch count: {MAX_EPOCH_COUNT}\n - batch size: {BATCH_SIZE*device_count}\n - steps per epoch: {STEPS_PER_EPOCH}\n - sample size: {SAMPLE_SIZE}")
+  print(f" - start time: {start.strftime('%Y-%m-%d %H:%M:%S')}")
   print("\n======================\n")
   
   # Use check_on_train_epoch_end=True to evaluate at the end of each epoch
-  stopping_callback = EarlyStopping(monitor="val_loss", min_delta=EARLY_STOP_MIN_DELTA, patience=EARLY_STOP_PATIENCE, verbose=True, mode='min', check_on_train_epoch_end=True)
-  callbacks = [stopping_callback]
+  verbose = True if device_id == 0 else False
+  stopper = EarlyStopping(monitor="val_loss", min_delta=EARLY_STOP_MIN_DELTA, patience=EARLY_STOP_PATIENCE, verbose=vervose, mode='min', check_on_train_epoch_end=True)
+  checkpointer = ModelCheckpoint(monitor='val_loss', mode="min", save_top_k=1, verbose=verbose)
+  callbacks = [stopper, checkpointer]
   
   # You could also use an additinal progress bar but default progress reporting was sufficient. Uncomment next line if desired
   # callbacks.append(TQDMProgressBar(refresh_rate=STEPS_PER_EPOCH, process_position=0))
@@ -379,7 +384,7 @@ def train(train_converter, val_converter, gpus=0, strategy=None, device_id=0, de
 
   report_duration(f"Training", start)
   
-  return model
+  return model.model if device_id == 0 else None
 
 # COMMAND ----------
 
@@ -389,7 +394,7 @@ def train(train_converter, val_converter, gpus=0, strategy=None, device_id=0, de
 
 # COMMAND ----------
 
-cpu_model = train(train_sample_converter, val_sample_converter, gpus=0)
+cpu_model = train(gpus=0)
 
 # COMMAND ----------
 
@@ -430,7 +435,7 @@ cpu_model = train(train_sample_converter, val_sample_converter, gpus=0)
 
 # COMMAND ----------
 
-train(train_sample_converter, val_sample_converter, gpus=1)
+gpu_model = train(gpus=1)
 
 # COMMAND ----------
 
@@ -455,7 +460,7 @@ train(train_sample_converter, val_sample_converter, gpus=1)
 # MAGIC 
 # MAGIC ---------------------
 # MAGIC 
-# MAGIC ***Observations:*** full training/validation cycle on GPU is faster than CPU but not by much, whereas benchmarks training runs without validation showed more that 3 times speedup on GPU*
+# MAGIC ***Observations:** full training/validation cycle on GPU is faster than CPU but not by much, whereas similar training runs without validation steps showed more that 3 times speedup on GPU*
 
 # COMMAND ----------
 
@@ -463,11 +468,9 @@ train(train_sample_converter, val_sample_converter, gpus=1)
 # MAGIC 
 # MAGIC #### Using multiple GPUs
 # MAGIC 
-# MAGIC ***Note:** This section will require a cluster with multiple GPUs (a single node cluster with multiple GPUs instace will suffice (e.g. p3.8xlarge on AWS or equivalent on other cloud providers). **However, given this code does not really work there is no point in launching a cluster for it***
+# MAGIC Simply passing a value of `gpus` parameter greater than 1 to a Trainer won't work, we also need to have a way to syncronise the losses between different models (each GPU would have its own model to train). This could be done by specifying a `strategy` parameter of the Trainer. According to docs, `If you request multiple GPUs or nodes without setting a mode, DDP Spawn will be automatically used.` [https://pytorch-lightning.readthedocs.io/en/stable/advanced/multi_gpu.html#distributed-modes]), however just giving a `gpus` value greater than 1 to the Trainer (e.g. `train(gpus=2)`) throws an error. It maybe worth checking why.
 # MAGIC 
-# MAGIC Simply passing a value of `gpus` parameter greater than 1 throws an error (e.g. `train(gpus=4)`). This could due to it running in `ddp_spawn` mode (documentation says `If you request multiple GPUs or nodes without setting a mode, DDP Spawn will be automatically used.` [https://pytorch-lightning.readthedocs.io/en/stable/advanced/multi_gpu.html#distributed-modes]) 
-# MAGIC 
-# MAGIC To use more than 1 GPU in Trainer we need to specify a strategy, e.g. `strategy=HorovodPlugin()`, but it produces the same loss within the same execution time as when using a single GPU, which draws a conclusion that only a single GPU gets used anyways. (this is also supported by output logs from only one process in verbose logging mode, but that could be because logging in other processes spawned for GPUs other then the 1st GPU are not shown in this process)
+# MAGIC So we need to specify a strategy, e.g. `strategy=HorovodPlugin()`, but it produces the same loss within the same execution time as when using a single GPU, which draws a conclusion that only a single GPU gets used anyways. (this is also supported by output logs from only one process in verbose logging mode, but that could be because logging in other processes spawned for GPUs other then the 1st GPU are not shown in this process)
 # MAGIC 
 # MAGIC ***Note/TODO:*** strangely, it complains about interactive mode if using `strategy="horovod"` but works with `strategy=HorovodPlugin()`. Maybe using an instance of DDP plugin instead of `strategy="ddp"` will also work, worth checking.
 
@@ -501,17 +504,19 @@ train(train_sample_converter, val_sample_converter, gpus=1)
 
 # MAGIC %md
 # MAGIC 
-# MAGIC #### Use Horovod runner
+# MAGIC ## Option 1: Use Horovod
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC #### Training with Horovod on a single machine with multiple GPUs
 # MAGIC 
 # MAGIC ***Note:** This section will require a cluster with multiple GPUs, a single node cluster with multiple GPUs instace will be sufficient (e.g. p3.8xlarge on AWS or equivalent on other cloud providers)*
 # MAGIC 
 # MAGIC To get the most out of distributed training we need to train each model on its own subset of data/batch, this is done by sharding the Petastorm batches into the number of GPUs we use. For that to work, Spark dataframe must also have least as many partitions as the number of devices we use.
 # MAGIC 
 # MAGIC To simplify things we'll only train on a subset of avaialable GPUs
-
-# COMMAND ----------
-
-DEVICE_COUNT = 2
 
 # COMMAND ----------
 
@@ -526,17 +531,14 @@ if _HOROVOD_AVAILABLE:
 
 # COMMAND ----------
 
-train_partitioned_converter, val_partitioned_converter = create_spark_converters(True, DEVICE_COUNT)
-
-# COMMAND ----------
-
 def train_hvd():
   hvd.init()
-  train(train_converter=train_partitioned_converter, val_converter=val_partitioned_converter, gpus=1, strategy="horovod", device_id=hvd.rank(), device_count=hvd.size())
+  return train(gpus=1, strategy="horovod", device_id=hvd.rank(), device_count=hvd.size())
+  
 
 # COMMAND ----------
 
-horovod.run(train_hvd, np=DEVICE_COUNT)
+hvd_model = horovod.run(train_hvd, np=MAX_DEVICE_COUNT_TO_USE)
 
 # COMMAND ----------
 
@@ -587,9 +589,21 @@ horovod.run(train_hvd, np=DEVICE_COUNT)
 
 # COMMAND ----------
 
+hvd_model
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC 
-# MAGIC #### Use `sparkdl.HorovodRunner`
+# MAGIC #### Training with Horovod on a multi-node GPU cluster
+# MAGIC 
+# MAGIC ***Note:** This section will require a multi-node GPU cluster, a cluster with 2 workers, each with a single GPU will be sufficient (e.g. p3.2xlarge on AWS or equivalent on other cloud providers)*
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC ## Option 2: Use `sparkdl.HorovodRunner`
 # MAGIC 
 # MAGIC https://databricks.com/notebooks/computer-vision/cv_03_%20model_training.html
 
@@ -601,28 +615,7 @@ from sparkdl import HorovodRunner
 
 # MAGIC %md
 # MAGIC 
-# MAGIC #### Use `TorchEstimator` with `SparkBackend`
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC 
-# MAGIC #### Adjust data loading for multi-GPU training
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # TODO
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC 
-# MAGIC ### Embed the model into the PyTorch Lightning model
-# MAGIC 
-# MAGIC 
-# MAGIC 
-# MAGIC LightningModule is just a torch.nn.Module
+# MAGIC ## Option 3: Use `TorchEstimator` with `SparkBackend`
 
 # COMMAND ----------
 
@@ -634,14 +627,17 @@ from sparkdl import HorovodRunner
 
 train_sample_converter.delete()
 val_sample_converter.delete()
-train_partitioned_converter.delete()
-val_partitioned_converter.delete()
+
+# COMMAND ----------
+
+# MAGIC %md 
+# MAGIC # Appendix
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC 
-# MAGIC ### Using PyTorch Distributed Data Parallel
+# MAGIC ## Option 4: Using PyTorch Distributed Data Parallel
 # MAGIC 
 # MAGIC - https://pytorch.org/docs/master/_modules/torch/nn/parallel/distributed.html#DistributedDataParallel
 # MAGIC ```
@@ -666,11 +662,6 @@ trainer = pl.Trainer(
 
 lit_model = LitModel()
 trainer.fit(lit_model)
-
-# COMMAND ----------
-
-# MAGIC %md 
-# MAGIC # Appendix
 
 # COMMAND ----------
 
