@@ -217,6 +217,7 @@ import datetime as dt
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.callbacks import TQDMProgressBar
+import mlflow
 
 
 def report_duration(action, start):
@@ -249,6 +250,10 @@ def train(model, dataloader, gpus=0,
   start = dt.datetime.now()
 
   if device_id == 0:
+    
+    # we trigger autolog here to ensure we capture all the params and the training process
+    mlflow.pytorch.autolog()
+    
     device = str(max(gpus, device_count)) + ' GPU' + ('s' if gpus > 1 or device_count > 1 else '') if gpus > 0  else 'CPU'
     print(f"Train on {device}:")
     print(f"- max epoch count: {MAX_EPOCH_COUNT}")
@@ -287,10 +292,13 @@ def train(model, dataloader, gpus=0,
       default_root_dir=default_dir
   )
   
-  trainer.fit(model, dataloader)
-
   if device_id == 0:
-    report_duration(f"Training", start)
-    print("\n\n---------------------")
+    with mlflow.start_run() as run:
+      trainer.fit(model, dataloader)
+      report_duration(f"Training", start)
+      print("\n\n---------------------")
+  else:
+    trainer.fit(model, dataloader)
+      
   
   return model.model if device_id == 0 else None

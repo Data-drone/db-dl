@@ -31,12 +31,37 @@ BATCH_SIZE = 64
 STEPS_PER_EPOCH = 15
 
 SAMPLE_SIZE = 1000
+
+# When using databricks repos, it is not possible to write into working directories
+# specifying a dbfs default dir helps to avoid this
 default_dir = '/dbfs/Users/brian.law@databricks.com/tmp/lightning_logs'
 
 EARLY_STOP_MIN_DELTA = 0.05
 EARLY_STOP_PATIENCE = 3
 
 NUM_DEVICES = 4
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
+# MAGIC ## Setup Mlflow Parameters
+# MAGIC 
+# MAGIC Mlflow is designed to only work with one python process. As we scale up our training job into multiple python processes we do not want to log the same model multiple times. Hence some additional boilerplate is required to manage this
+
+# COMMAND ----------
+
+import os
+
+## Specifying the mlflow host server and access token 
+# We put them to a variable to feed into horovod later on
+db_host = "https://e2-demo-tokyo.cloud.databricks.com/"
+db_token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+
+# We put them into these environment variables as this is where mlflow will look by default
+os.environ['DATABRICKS_HOST'] = db_host
+os.environ['DATABRICKS_TOKEN'] = db_token
+
 
 # COMMAND ----------
 
@@ -107,6 +132,8 @@ def prepare_data(data_dir: str, num_devices: int):
     #class_index = udf(_to_class_index, T.LongType())  
     flowers_dataset = flowers_dataset.withColumn("label", udf_class(classes)(col("label")) )
     
+    #### the following code is to make sure to sample each class by the proportion that it appears in the original dataset
+    # Spark doesn't include a Stratified Sampling class hence we have to calculate what fraction each class is.
     total_size = flowers_dataset.count()
     print(f"Dataset size: {total_size}")
     
@@ -133,12 +160,6 @@ flowers_df, train_converter, val_converter = prepare_data(data_dir=Data_Director
 
 datamodule = FlowersDataModule(train_converter=train_converter, 
                                val_converter=val_converter)
-
-# COMMAND ----------
-
-# MAGIC %sh
-# MAGIC # Check the GPU Status of Node
-# MAGIC nvidia-smi
 
 # COMMAND ----------
 
@@ -204,6 +225,12 @@ if _HOROVOD_AVAILABLE:
 
 def train_hvd():
   hvd.init()
+  
+  # mlflow workaround to ensure that horovod subprocesses can find and connect to mlflow
+  mlflow.set_tracking_uri("databricks")
+  os.environ['DATABRICKS_HOST'] = db_host
+  os.environ['DATABRICKS_TOKEN'] = db_token
+
   
   hvd_model = LitClassificationModel(class_count=5, learning_rate=1e-5, device_id=hvd.rank(), device_count=hvd.size())
   hvd_datamodule = FlowersDataModule(train_converter, val_converter, device_id=hvd.rank(), device_count=hvd.size())
