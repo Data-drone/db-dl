@@ -19,10 +19,12 @@
 # MAGIC For Widgets see: 
 # MAGIC - AWS: https://docs.databricks.com/notebooks/widgets.html
 # MAGIC - Azure: https://docs.microsoft.com/en-us/azure/databricks/notebooks/widgets
+# MAGIC - GCP: https://docs.gcp.databricks.com/notebooks/widgets.html
 # MAGIC 
 # MAGIC For Workflows see:
 # MAGIC - AWS: https://docs.databricks.com/data-engineering/jobs/index.html
 # MAGIC - Azure: https://docs.microsoft.com/en-us/azure/databricks/data-engineering/jobs/
+# MAGIC - GCP: https://docs.gcp.databricks.com/data-engineering/index.html
 
 # COMMAND ----------
 
@@ -34,12 +36,12 @@ SAMPLE_SIZE = 1000
 
 # When using databricks repos, it is not possible to write into working directories
 # specifying a dbfs default dir helps to avoid this
-default_dir = '/dbfs/Users/brian.law@databricks.com/tmp/lightning_logs'
+default_dir = '/dbfs/Users/brian.law@databricks.com/tmp/lightning'
 
 EARLY_STOP_MIN_DELTA = 0.05
 EARLY_STOP_PATIENCE = 3
 
-NUM_DEVICES = 4
+NUM_DEVICES = 8
 
 # COMMAND ----------
 
@@ -186,7 +188,7 @@ model = LitClassificationModel(class_count=5, learning_rate=1e-5)
 
 # COMMAND ----------
 
-train(model, datamodule, gpus=1)
+train(model, datamodule, gpus=1, default_dir=default_dir)
 
 # COMMAND ----------
 
@@ -196,13 +198,9 @@ train(model, datamodule, gpus=1)
 
 # COMMAND ----------
 
-train(model, datamodule, gpus=4, strategy='dp')
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC 
-# MAGIC # Horovod Train
+# MAGIC ### Horovod Single Node
 
 # COMMAND ----------
 
@@ -230,13 +228,19 @@ def train_hvd():
   mlflow.set_tracking_uri("databricks")
   os.environ['DATABRICKS_HOST'] = db_host
   os.environ['DATABRICKS_TOKEN'] = db_token
+  
+  # we hard code the experiment ID to make sure we log to the right experiment
+  ## worker nodes may not see the experiment id of the notebook
+  mlflow_experiment_id = 'b5fedd94c5524daab5f574ee7e132f1f'
 
   
   hvd_model = LitClassificationModel(class_count=5, learning_rate=1e-5, device_id=hvd.rank(), device_count=hvd.size())
   hvd_datamodule = FlowersDataModule(train_converter, val_converter, device_id=hvd.rank(), device_count=hvd.size())
   
   # `gpus` parameter here should be 1 because the parallelism is controlled by Horovod
-  return train(hvd_model, hvd_datamodule, gpus=1, strategy="horovod", device_id=hvd.rank(), device_count=hvd.size())
+  return train(hvd_model, hvd_datamodule, gpus=1, device_id=hvd.rank(), device_count=hvd.size(), 
+               mlflow_experiment_id=mlflow_experiment_id,
+              default_dir=default_dir)
   
 
 # COMMAND ----------
@@ -245,9 +249,20 @@ from sparkdl import HorovodRunner
 
 # This will launch a distributed training on np devices
 hr = HorovodRunner(np=-4, driver_log_verbosity='all')
+hvd_model = hr.run(train_hvd)
 
-# Need to solve the issue with things and stuff
+# COMMAND ----------
 
+# MAGIC %md
+# MAGIC 
+# MAGIC # Multi-Node with Horovod 
+
+# COMMAND ----------
+
+from sparkdl import HorovodRunner
+
+# This will launch a distributed training on np devices
+hr = HorovodRunner(np=8, driver_log_verbosity='all')
 hvd_model = hr.run(train_hvd)
 
 # COMMAND ----------

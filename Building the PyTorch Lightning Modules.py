@@ -242,10 +242,12 @@ def report_duration(action, start):
   print(msg)
 
 
-def train(model, dataloader, gpus=0, 
-          strategy=None, device_id=0, 
-          device_count=1, logging_level=logging.INFO,
-          default_dir='/dbfs/tmp/trainer_logs'):
+def train(model, dataloader, gpus:int=0, 
+          strategy:str=None, device_id:int=0, 
+          device_count:int=1, logging_level=logging.INFO,
+          default_dir:str='/dbfs/tmp/trainer_logs',
+          ckpt_restore:str=None,
+          mlflow_experiment_id:str=None):
   
   start = dt.datetime.now()
 
@@ -268,9 +270,6 @@ def train(model, dataloader, gpus=0,
                           verbose=verbose, mode='min', check_on_train_epoch_end=True)
   callbacks = [stopper]
   
-  # Uncomment the following lines to add checkpointing if needed
-  # checkpointer = ModelCheckpoint(monitor='val_loss', mode="min", save_top_k=1, verbose=verbose)
-  # callbacks.append(checkpointer)
   
   # You could also use an additinal progress bar but default progress reporting was sufficient. Uncomment next line if desired
   # callbacks.append(TQDMProgressBar(refresh_rate=STEPS_PER_EPOCH, process_position=0))
@@ -289,16 +288,17 @@ def train(model, dataloader, gpus=0,
       reload_dataloaders_every_n_epochs=1,  # need to set this to 1
       strategy=strategy,
       callbacks=callbacks,
-      default_root_dir=default_dir
+      default_root_dir=default_dir  
   )
   
   if device_id == 0:
-    with mlflow.start_run() as run:
-      trainer.fit(model, dataloader)
+    with mlflow.start_run(experiment_id=mlflow_experiment_id) as run:
+      trainer.fit(model, dataloader, ckpt_path=ckpt_restore)
+      trainer.save_checkpoint("example.ckpt")
       report_duration(f"Training", start)
       print("\n\n---------------------")
   else:
-    trainer.fit(model, dataloader)
+    trainer.fit(model, dataloader, ckpt_path=ckpt_restore)
       
   
   return model.model if device_id == 0 else None
