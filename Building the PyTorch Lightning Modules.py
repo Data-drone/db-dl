@@ -36,7 +36,7 @@ class LitClassificationModel(pl.LightningModule):
   
   """
   
-  def __init__(self, class_count: int, learning_rate:int, momentum:float=0.9, logging_level=logging.INFO,
+  def __init__(self, class_count: int, learning_rate:float, momentum:float=0.9, logging_level=logging.INFO,
               device_id:int=0, device_count:int=1):
     
     super().__init__()
@@ -170,7 +170,7 @@ class FlowersDataModule(pl.LightningDataModule):
     self.val_dataloader_context = self.val_converter.make_torch_dataloader(transform_spec=self._get_transform_spec(), 
                                                                            num_epochs=None, 
                                                                            cur_shard=self.device_id, 
-                                                                           shard_count=self.device_count,  
+                                                                           shard_count=self.device_count,
                                                                            batch_size=BATCH_SIZE*self.device_count)
     return self.val_dataloader_context.__enter__()
     
@@ -294,7 +294,6 @@ def train(model, dataloader, gpus:int=0,
   if device_id == 0:
     with mlflow.start_run(experiment_id=mlflow_experiment_id) as run:
       trainer.fit(model, dataloader, ckpt_path=ckpt_restore)
-      trainer.save_checkpoint("example.ckpt")
       report_duration(f"Training", start)
       print("\n\n---------------------")
   else:
