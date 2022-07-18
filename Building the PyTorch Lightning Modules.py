@@ -32,23 +32,23 @@ class LitClassificationModel(pl.LightningModule):
   
   Our main model class
   
-  We could take out the device_id and device_count params which are only used for logging
   
   """
   
   def __init__(self, class_count: int, learning_rate:float, momentum:float=0.9, logging_level=logging.INFO,
-              device_id:int=0, device_count:int=1):
+              device_id:int=0, device_count:int=1, family:str='mobilenet'):
     
     super().__init__()
     self.learn_rate = learning_rate
     self.momentum = momentum
-    self.model = self.get_model(class_count, learning_rate)
+    self.model = self.get_model(class_count, learning_rate, family)
     self.state = {"epochs": 0}
     self.logging_level = logging_level
     self.device_id = device_id
     self.device_count = device_count
+    self.family = family
   
-  def get_model(self, class_count, lr):
+  def get_model(self, class_count, lr, family):
     """
     
     This is the function that initialises our model.
@@ -56,20 +56,32 @@ class LitClassificationModel(pl.LightningModule):
     
     """
     
-    model = models.mobilenet_v2(pretrained=True)
+    if family == 'mobilenet':
+      model = models.mobilenet_v2(pretrained=True)
+    elif family == 'resnext':
+      model = models.resnext50_32x4d(pretrained=True)
     
     # Freeze parameters in the feature extraction layers and replace the last layer
     for param in model.parameters():
       param.requires_grad = False
 
     # New modules have `requires_grad = True` by default
-    model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, class_count)
+    if family == 'mobilenet':
+      model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, class_count)
+    elif family == 'resnext':
+      model.fc = torch.nn.Linear(model.fc.in_features, class_count)
+    
     
     return model
   
   def configure_optimizers(self):
-    optimizer = torch.optim.SGD(self.model.classifier[1].parameters(), 
-                                lr=self.learn_rate, momentum=self.momentum)
+    
+    if self.family == 'mobilenet':
+      params = self.model.classifier[1].parameters()
+    elif self.family == 'resnext':
+      params = self.model.fc.parameters()
+    
+    optimizer = torch.optim.SGD(params, lr=self.learn_rate, momentum=self.momentum)
     
     return optimizer
   
@@ -260,13 +272,13 @@ def train(model, dataloader, gpus:int=0,
     print(f"Train on {device}:")
     print(f"- max epoch count: {MAX_EPOCH_COUNT}")
     print(f"- batch size: {BATCH_SIZE*device_count}")
-    print(f"- steps per epoch: {STEPS_PER_EPOCH}")
-    print(f"- sample size: {SAMPLE_SIZE}")
+    #print(f"- steps per epoch: {STEPS_PER_EPOCH}")
     print("\n======================\n")
   
   # Use check_on_train_epoch_end=True to evaluate at the end of each epoch
   verbose = True if device_id == 0 else False
-  stopper = EarlyStopping(monitor="val_loss", min_delta=EARLY_STOP_MIN_DELTA, patience=EARLY_STOP_PATIENCE, 
+  stopper = EarlyStopping(monitor="val_loss", min_delta=EARLY_STOP_MIN_DELTA, patience=EARLY_STOP_PATIENCE,
+                          stopping_threshold=0.55,
                           verbose=verbose, mode='min', check_on_train_epoch_end=True)
   callbacks = [stopper]
   

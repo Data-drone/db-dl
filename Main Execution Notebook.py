@@ -28,18 +28,18 @@
 
 # COMMAND ----------
 
-MAX_EPOCH_COUNT = 15
+MAX_EPOCH_COUNT = 100
 BATCH_SIZE = 64
 STEPS_PER_EPOCH = 15
 
-SAMPLE_SIZE = 1000
+#SAMPLE_SIZE = 1000
 
 # When using databricks repos, it is not possible to write into working directories
 # specifying a dbfs default dir helps to avoid this
 default_dir = '/dbfs/Users/brian.law@databricks.com/tmp/lightning'
 
-EARLY_STOP_MIN_DELTA = 0.05
-EARLY_STOP_PATIENCE = 3
+EARLY_STOP_MIN_DELTA = 0.01
+EARLY_STOP_PATIENCE = 10
 
 NUM_DEVICES = 8
 
@@ -163,6 +163,8 @@ flowers_df, train_converter, val_converter = prepare_data(data_dir=Data_Director
 datamodule = FlowersDataModule(train_converter=train_converter, 
                                val_converter=val_converter)
 
+STEPS_PER_EPOCH = len(train_converter) //  BATCH_SIZE
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -194,13 +196,7 @@ train(model, datamodule, gpus=1, default_dir=default_dir)
 
 # MAGIC %md
 # MAGIC 
-# MAGIC ## Multi GPU
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC 
-# MAGIC ### Horovod Single Node
+# MAGIC ## Multi GPU with HorovodRunner
 
 # COMMAND ----------
 
@@ -233,8 +229,9 @@ def train_hvd():
   ## worker nodes may not see the experiment id of the notebook
   mlflow_experiment_id = 'b5fedd94c5524daab5f574ee7e132f1f'
 
+  STEPS_PER_EPOCH = len(train_converter)*hvd.size() //  BATCH_SIZE
   
-  hvd_model = LitClassificationModel(class_count=5, learning_rate=1e-5, device_id=hvd.rank(), device_count=hvd.size())
+  hvd_model = LitClassificationModel(class_count=5, learning_rate=1e-5*hvd.size(), device_id=hvd.rank(), device_count=hvd.size())
   hvd_datamodule = FlowersDataModule(train_converter, val_converter, device_id=hvd.rank(), device_count=hvd.size())
   
   # `gpus` parameter here should be 1 because the parallelism is controlled by Horovod
@@ -255,7 +252,7 @@ hvd_model = hr.run(train_hvd)
 
 # MAGIC %md
 # MAGIC 
-# MAGIC # Multi-Node with Horovod 
+# MAGIC # Multi-Node Training 
 
 # COMMAND ----------
 
