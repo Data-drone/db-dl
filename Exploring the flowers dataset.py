@@ -11,7 +11,9 @@
 # MAGIC 
 # MAGIC ## Setup
 # MAGIC 
-# MAGIC The notebook can be run on a standard Databricks ML Runtime Cluster.
+# MAGIC The notebook can be run on a non-GPU standard Databricks ML Runtime Cluster.
+# MAGIC 
+# MAGIC It has been tested with both Databricks Runtime 10.4 ML LTS and 11.1 ML with and without GPU
 # MAGIC 
 # MAGIC The Flowers dataset comes as one of the Databricks provided demo datasets in the */databricks-datasets/* folder.
 # MAGIC The normal unprocessed dataset is also available in the folder */databricks-datasets/flower_photos*
@@ -19,12 +21,12 @@
 # COMMAND ----------
 
 # list the contents of the flowers dataset folder
-dbutils.fs.ls('/databricks-datasets/flowers/delta')
+display(dbutils.fs.ls('/databricks-datasets/flowers/delta'))
 
 # COMMAND ----------
 
 # list the contents of the flowers dataset folder
-dbutils.fs.ls('/databricks-datasets/flower_photos')
+display(dbutils.fs.ls('/databricks-datasets/flower_photos'))
 
 # COMMAND ----------
 
@@ -81,24 +83,6 @@ display(training_set)
 
 # COMMAND ----------
 
-# Convert string to numeric
-classes = list(training_set.select("label").distinct().toPandas()["label"])
-
-def to_class_index(class_name:str):
-  """
-  Converts classes to a class_index so that we can create a tensor object
-  """
-  
-  return classes.index(class_name)
-
-class_index = udf(to_class_index, T.LongType())  # PyTorch loader required a long
-
-preprocessed_df = training_set.withColumn("label", class_index(col("label")))
-
-display(preprocessed_df)
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC 
 # MAGIC ## Understanding Petastorm
@@ -107,6 +91,32 @@ display(preprocessed_df)
 # MAGIC For PyTorch, Petastorm provides an adapter into the `torch.utils.data.DataLoader` format
 # MAGIC 
 # MAGIC Note that the supported datatypes in Spark and PyTorch are different so there can be conversion errors along the way. In this case, PyTorch tensor does not support string object so we need to convert the `Label` to a numeric first. 
+
+# COMMAND ----------
+
+# Collect the set of string labels, andconvert the strings to numeric indices
+classes = list(training_set.select("label").distinct().toPandas()["label"])
+
+def to_class_index(class_name:str):
+  """
+  Converts classes to a class_index so that we can create a tensor object
+  
+  Args:
+    class_name: the string form of a the classname
+    
+  Returns:
+    the numeric index for a string class
+  
+  """
+  
+  return classes.index(class_name)
+
+
+class_index = udf(to_class_index, T.LongType())  # PyTorch loader required a long
+
+preprocessed_df = training_set.withColumn("label", class_index(col("label")))
+
+display(preprocessed_df)
 
 # COMMAND ----------
 
@@ -148,7 +158,23 @@ def preprocess(img):
 
 # COMMAND ----------
 
-def transform_rows(batch):
+def transform_rows(batch: dict):
+  
+    """
+    
+    This function receives a batch of entries in dict form that need to be processed.
+    In this case, our our processing function will open the image perform a some transfomations
+    then turn it into a numeric tensor
+    
+    Args:
+      batch: dict
+        input batch
+    
+    Returns:
+      batch: dict
+        transformed batch 
+    
+    """
     
     # To keep things simple, use the same transformation both for training and validation
     batch["features"] = batch["content"].map(lambda x: preprocess(x).numpy())
@@ -170,17 +196,9 @@ transform_func = TransformSpec(transform_rows,
 
 with peta_conv_df.make_torch_dataloader(transform_spec=transform_func) as converted_dataset:
   
-  # lets check out a few batches
-  #for i in range(0, 2):
-  #  batch = next(iter(converted_dataset))
-  #  print("iteration: " + str(i))
-  #  print(batch)
-  
   sample = next(iter(converted_dataset))
   print(sample)
-  #for batch in converted_dataset:
-  #  for item in batch:
-  #    print(item)
+  
 
 # COMMAND ----------
 

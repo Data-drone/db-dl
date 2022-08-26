@@ -1,7 +1,7 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC 
-# MAGIC # Building our PyTorch Lightning Model
+# MAGIC # Building the PyTorch Lightning Model
 # MAGIC 
 # MAGIC **[NOTE]**
 # MAGIC 
@@ -16,6 +16,16 @@
 # MAGIC 
 # MAGIC PyTorch Lightning model code can be organised into the Lightning Module class
 # MAGIC this gives a convenient wrapper for the Model definition and the optimisers
+# MAGIC 
+# MAGIC On DBR 10.4 ML LTS set the version to 1.6.5 ie
+# MAGIC `%pip install pytorch_lightning==1.6.5 torchmetrics`
+# MAGIC 
+# MAGIC On DBR 11.1 ML set the version to 1.7.2 ie
+# MAGIC `%pip install pytorch_lightning==1.7.2 torchmetrics`
+
+# COMMAND ----------
+
+# MAGIC %pip install pytorch_lightning==1.7.2 torchmetrics
 
 # COMMAND ----------
 
@@ -313,3 +323,7 @@ def train(model, dataloader, gpus:int=0,
       
   
   return model.model if device_id == 0 else None
+
+# COMMAND ----------
+
+
