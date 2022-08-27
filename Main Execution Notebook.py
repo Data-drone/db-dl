@@ -28,15 +28,19 @@
 
 # COMMAND ----------
 
+username = spark.sql("SELECT current_user()").first()['current_user()']
+username
+
+# COMMAND ----------
+
 MAX_EPOCH_COUNT = 100
 BATCH_SIZE = 64
 STEPS_PER_EPOCH = 15
 
-#SAMPLE_SIZE = 1000
-
 # When using databricks repos, it is not possible to write into working directories
 # specifying a dbfs default dir helps to avoid this
-default_dir = '/dbfs/Users/brian.law@databricks.com/tmp/lightning'
+default_dir = f'/dbfs/Users/{username}/tmp/lightning'
+experiment_path = f'/Users/{username}/pytorch-lightning-on-databricks'
 
 EARLY_STOP_MIN_DELTA = 0.01
 EARLY_STOP_PATIENCE = 10
@@ -54,15 +58,19 @@ NUM_DEVICES = 8
 # COMMAND ----------
 
 import os
+import mlflow
 
 ## Specifying the mlflow host server and access token 
 # We put them to a variable to feed into horovod later on
-db_host = "https://e2-demo-tokyo.cloud.databricks.com/"
+db_host = "https://e2-demo-tokyo.cloud.databricks.com/"  # CHANGE THIS!
 db_token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
 
 # We put them into these environment variables as this is where mlflow will look by default
 os.environ['DATABRICKS_HOST'] = db_host
 os.environ['DATABRICKS_TOKEN'] = db_token
+
+# We manually create the experiment so that we know the id and can send that to the worker nodes when we scale
+experiment = mlflow.set_experiment(experiment_path)
 
 
 # COMMAND ----------
@@ -180,6 +188,16 @@ model = LitClassificationModel(class_count=5, learning_rate=1e-5)
 
 # MAGIC %md
 # MAGIC 
+# MAGIC # Cluster Configuration
+# MAGIC 
+# MAGIC The following experiments were tested on the g4dn series of AWS instances. As discussed in the blog article, we recommend a minimum of 64GB RAM (g4dn.4xlarge) for the driver and workers. Having less can result in the following error partway through the training process: 
+# MAGIC 
+# MAGIC `Fatal error: The Python kernel is unresponsive`
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC 
 # MAGIC # Single Node Train
 
 # COMMAND ----------
@@ -225,14 +243,16 @@ def train_hvd():
   os.environ['DATABRICKS_HOST'] = db_host
   os.environ['DATABRICKS_TOKEN'] = db_token
   
-  # we hard code the experiment ID to make sure we log to the right experiment
-  ## worker nodes may not see the experiment id of the notebook
-  mlflow_experiment_id = 'b5fedd94c5524daab5f574ee7e132f1f'
+  ## we pass the experiment id over to the workers
+  mlflow_experiment_id = experiment.experiment_id
 
   STEPS_PER_EPOCH = len(train_converter)*hvd.size() //  BATCH_SIZE
   
-  hvd_model = LitClassificationModel(class_count=5, learning_rate=1e-5*hvd.size(), device_id=hvd.rank(), device_count=hvd.size())
-  hvd_datamodule = FlowersDataModule(train_converter, val_converter, device_id=hvd.rank(), device_count=hvd.size())
+  hvd_model = LitClassificationModel(class_count=5, learning_rate=1e-5*hvd.size(), 
+                                     device_id=hvd.rank(), device_count=hvd.size())
+  
+  hvd_datamodule = FlowersDataModule(train_converter, val_converter, 
+                                     device_id=hvd.rank(), device_count=hvd.size())
   
   # `gpus` parameter here should be 1 because the parallelism is controlled by Horovod
   return train(hvd_model, hvd_datamodule, gpus=1, device_id=hvd.rank(), device_count=hvd.size(), 
@@ -244,8 +264,8 @@ def train_hvd():
 
 from sparkdl import HorovodRunner
 
-# This will launch a distributed training on np devices
-hr = HorovodRunner(np=-4, driver_log_verbosity='all')
+# with a negative np number, we will launch multi gpu training on one node
+hr = HorovodRunner(np=-1, driver_log_verbosity='all')
 hvd_model = hr.run(train_hvd)
 
 # COMMAND ----------
@@ -259,7 +279,7 @@ hvd_model = hr.run(train_hvd)
 from sparkdl import HorovodRunner
 
 # This will launch a distributed training on np devices
-hr = HorovodRunner(np=8, driver_log_verbosity='all')
+hr = HorovodRunner(np=2, driver_log_verbosity='all')
 hvd_model = hr.run(train_hvd)
 
 # COMMAND ----------
